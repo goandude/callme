@@ -1,5 +1,5 @@
 // Filename: /pages/index.tsx
-// Description: FINAL VERSION. Fixes broken media links by using a robust JSON-based messaging format.
+// Description: FINAL VERSION. Increased chat message font size for better readability.
 
 // --- Imports ---
 import { useState, useRef, useEffect, FC, KeyboardEvent, ChangeEvent } from 'react';
@@ -15,7 +15,6 @@ interface OfferPayload { offer: RTCSessionDescriptionInit; }
 interface AnswerPayload { answer: RTCSessionDescriptionInit; }
 interface CandidatePayload { candidate: RTCIceCandidateInit; }
 interface Message { id: string; userId: string; text: string; }
-// Type for our new structured media message
 interface MediaMessagePayload {
     isMedia: true;
     type: string;
@@ -23,7 +22,7 @@ interface MediaMessagePayload {
     name: string;
 }
 
-// --- Chat Controller Class (Unchanged) ---
+// --- Chat Controller Class ---
 class ChatController {
   private pc: RTCPeerConnection | null = null;
   private localStream: MediaStream | null = null;
@@ -79,7 +78,9 @@ const Home: FC = () => {
     useEffect(() => {
         if (controllerRef.current === null) {
             const chatController = new ChatController(
-                setAppState, setLocalStream, setRemoteStream,
+                setAppState,
+                setLocalStream,
+                setRemoteStream,
                 (message) => setMessages(prev => [...prev, message]),
                 () => setMessages([])
             );
@@ -111,20 +112,14 @@ const Home: FC = () => {
     const handleFileSelect = async (event: ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0];
         if (!file) return;
-
         const controller = controllerRef.current;
         if (!controller) return;
-
-        // *** NEW: UPLOAD LOGIC ***
         setIsUploading(true);
         try {
             const filePath = `public/${controller.getUserId()}-${Date.now()}-${file.name}`;
             const { error: uploadError } = await supabase.storage.from('media-files').upload(filePath, file);
             if (uploadError) throw uploadError;
-
             const { data } = supabase.storage.from('media-files').getPublicUrl(filePath);
-            
-            // *** NEW: Create a structured JSON message for media ***
             const messagePayload: MediaMessagePayload = {
                 isMedia: true,
                 type: file.type,
@@ -134,11 +129,10 @@ const Home: FC = () => {
             const messageText = JSON.stringify(messagePayload);
             const sentMessage = controller.sendMessage(messageText);
             if (sentMessage) setMessages(prev => [...prev, sentMessage]);
-
         } catch (error) {
             console.error("Error uploading file:", error);
             const sentMessage = controller.sendMessage(`[Error: Failed to upload ${file.name}]`);
-             if (sentMessage) setMessages(prev => [...prev, sentMessage]);
+            if (sentMessage) setMessages(prev => [...prev, sentMessage]);
         } finally {
             setIsUploading(false);
         }
@@ -155,9 +149,16 @@ const Home: FC = () => {
     const handleToggleMute = () => { controllerRef.current?.toggleMute(); setIsMuted(!isMuted); }
     const handleToggleVideo = () => { controllerRef.current?.toggleVideo(); setIsVideoOff(!isVideoOff); }
 
-    const getStatusText = (): string => { /* Unchanged */ return '' };
+    const getStatusText = (): string => {
+        switch (appState) {
+            case 'IDLE': return 'Ready to Chat';
+            case 'SEARCHING': return 'Searching for a partner...';
+            case 'CONNECTING': return 'Connecting...';
+            case 'CONNECTED': return 'Connected';
+            default: return 'Loading...';
+        }
+    };
 
-    // New component to render media messages from a JSON payload
     const MediaMessage = ({ payload }: { payload: MediaMessagePayload }) => {
         let content;
         if (payload.type.startsWith('image/')) {
@@ -167,7 +168,6 @@ const Home: FC = () => {
         } else if (payload.type.startsWith('audio/')) {
             content = <audio src={payload.url} controls className="w-full"></audio>;
         } else {
-            // Fallback for non-renderable media types
             content = <div className='text-sm'>{payload.name || 'Shared file'}</div>
         }
         return (
@@ -230,7 +230,6 @@ const Home: FC = () => {
                         <button onClick={() => setIsChatOpen(false)} className="md:hidden"><X size={24}/></button>
                     </div>
                     <div className="flex-1 p-4 overflow-y-auto space-y-4">
-                        {/* *** NEW: JSON PARSING LOGIC FOR RENDERING MESSAGES *** */}
                         {messages.map(msg => {
                             let mediaPayload: MediaMessagePayload | null = null;
                             try {
@@ -247,7 +246,7 @@ const Home: FC = () => {
                                         {mediaPayload ? (
                                             <MediaMessage payload={mediaPayload} />
                                         ) : (
-                                            <p className="text-sm break-words">{msg.text}</p>
+                                            <p className="text-base break-words">{msg.text}</p>
                                         )}
                                     </div>
                                 </div>
