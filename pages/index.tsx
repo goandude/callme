@@ -1,5 +1,5 @@
 // Filename: /pages/index.tsx
-// FINAL VERSION - Includes ICE Restart logic for reconnections.
+// MODIFIED: Uses hardcoded, temporary TURN credentials from .env.local
 
 import { useState, useRef, useEffect, FC, KeyboardEvent, ChangeEvent } from 'react';
 import Head from 'next/head'; 
@@ -8,8 +8,8 @@ import { RealtimeChannel, RealtimePresenceState, Session } from '@supabase/supab
 import { Phone, Video, VideoOff, Mic, MicOff, Send, SkipForward, MessageSquare, X, Paperclip, Smile, Download, Users, CircleDot } from 'lucide-react';
 import Picker, { EmojiClickData } from 'emoji-picker-react';
 import ProfileSetupModal from '../components/ProfileSetupModal';
-import MatchingOptionsBar from '../components/MatchingOptionsBar';
 import ChatPanelContent from '../components/ChatPanelContent';
+import { iceServers } from '../lib/iceServers'; // MODIFIED: Import the static config
 
 // --- Type Definitions ---
 type AppState = 'IDLE' | 'AWAITING_MEDIA' | 'READY' | 'SEARCHING' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
@@ -41,14 +41,60 @@ class ChatController {
   private onRemoteStream: (stream: MediaStream | null) => void;
   private onNewMessage: (message: Message) => void;
   private onNewConnection: () => void;
-  constructor(userId: string, onStateChange: (state: AppState) => void, onLocalStream: (stream: MediaStream | null) => void, onRemoteStream: (stream: MediaStream | null) => void, onNewMessage: (message: Message) => void, onNewConnection: () => void) { this.userId = userId; this.onStateChange = onStateChange; this.onLocalStream = onLocalStream; this.onRemoteStream = onRemoteStream; this.onNewMessage = onNewMessage; this.onNewConnection = onNewConnection; }
+
+  // REVERTED: Constructor no longer needs iceServers
+  constructor(
+    userId: string,
+    onStateChange: (state: AppState) => void,
+    onLocalStream: (stream: MediaStream | null) => void,
+    onRemoteStream: (stream: MediaStream | null) => void,
+    onNewMessage: (message: Message) => void,
+    onNewConnection: () => void
+  ) {
+    this.userId = userId;
+    this.onStateChange = onStateChange;
+    this.onLocalStream = onLocalStream;
+    this.onRemoteStream = onRemoteStream;
+    this.onNewMessage = onNewMessage;
+    this.onNewConnection = onNewConnection;
+  }
+
   private setState = (state: AppState) => { this.internalState = state; this.onStateChange(state); this.updatePresenceStatus(); }
   private updatePresenceStatus = () => { if (!this.presenceChannel) return; let status: PresenceStatus = 'online'; if (this.internalState === 'SEARCHING') status = 'searching'; if (this.internalState === 'CONNECTED') status = 'connected'; this.presenceChannel.track({ status }); }
   public getUserId = (): string => this.userId;
   public initialize = async (): Promise<void> => { this.setState('AWAITING_MEDIA'); try { if (!this.localStream) { const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true }); this.localStream = stream; this.onLocalStream(stream); } this.presenceChannel = supabase.channel('global-presence', { config: { presence: { key: this.userId } } }); this.presenceChannel.subscribe(async (status) => { if (status === 'SUBSCRIBED') { this.updatePresenceStatus(); } }); this.setState('IDLE'); } catch (err) { this.setState('ERROR'); } }
   public startChat = async (): Promise<void> => { if (this.isTransitioning) return; this.isTransitioning = true; this.setState('SEARCHING'); await this.cleanup(); const dmChannelName = `dm-${this.userId}`; this.directMessageChannel = supabase.channel(dmChannelName); this.directMessageChannel.on('broadcast', { event: 'pairing_request' }, async ( { payload }: { payload: { roomId: string } } ) => { if (this.pc || this.isTransitioning) return; this.isTransitioning = true; this.isOfferCreator = false; await this.cleanupLobby(); await this.joinRoom(payload.roomId); await this.roomChannel?.send({ type: 'broadcast', event: 'peer_ready', payload: {} }); this.isTransitioning = false; }).subscribe(); this.lobbyChannel = supabase.channel('lobby', { config: { broadcast: { ack: true } } }); this.lobbyChannel.on('broadcast', { event: 'looking_for_partner' }, async ({ payload }: { payload: { directChannel: string } }) => { if (this.pc || this.isTransitioning) return; if (payload.directChannel === dmChannelName) return; this.isTransitioning = true; this.isOfferCreator = true; await this.cleanupLobby(); const newRoomId = `room_${Math.random().toString(36).substring(2, 12)}`; this.pairingTimeout = setTimeout(() => { this.hangUp(true); }, 5000); await supabase.channel(payload.directChannel).send({ type: 'broadcast', event: 'pairing_request', payload: { roomId: newRoomId } }); await this.joinRoom(newRoomId); this.isTransitioning = false; }).subscribe(async (status) => { if (status === 'SUBSCRIBED') { this.isTransitioning = false; await this.lobbyChannel?.send({ type: 'broadcast', event: 'looking_for_partner', payload: { directChannel: dmChannelName } }); } }); }
   private joinRoom = async (roomId: string): Promise<void> => { this.setState('CONNECTING'); this.roomChannel = supabase.channel(`signaling-${roomId}`); this.roomChannel.on('broadcast', { event: 'peer_ready' }, async () => { if (this.isOfferCreator) { if (this.pairingTimeout) clearTimeout(this.pairingTimeout); this.pairingTimeout = null; await this.createOffer(); } }).on('broadcast', { event: 'offer' }, async ({ payload }: { payload: OfferPayload }) => { if (!this.pc) this.createPeerConnection(); await this.pc!.setRemoteDescription(new RTCSessionDescription(payload.offer)); this.processQueuedCandidates(); const answer = await this.pc!.createAnswer(); await this.pc!.setLocalDescription(answer); await this.roomChannel?.send({ type: 'broadcast', event: 'answer', payload: { answer } }); }).on('broadcast', { event: 'answer' }, async ({ payload }: { payload: AnswerPayload }) => { if (this.pc?.signalingState === 'have-local-offer') { await this.pc.setRemoteDescription(new RTCSessionDescription(payload.answer)); this.processQueuedCandidates(); } }).on('broadcast', { event: 'candidate' }, async ({ payload }: { payload: CandidatePayload }) => { if (this.pc?.remoteDescription) { await this.pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } else { this.queuedCandidates.push(payload.candidate); } }).subscribe(); }
-  private createPeerConnection = (): void => { if (this.pc) return; this.pc = new RTCPeerConnection({ iceServers: [ { urls: 'stun:stun.l.google.com:19302' }, { urls: 'turn:relay.metered.ca:80', username: '83e21626570551a6152b3433', credential: 'aDN0a7Hj6sUe3R3a' } ] }); this.dataChannel = this.pc.createDataChannel('chat'); this.dataChannel.onmessage = (e) => this.onNewMessage(JSON.parse(e.data)); this.pc.ondatachannel = (e) => { this.dataChannel = e.channel; this.dataChannel.onmessage = (ev) => this.onNewMessage(JSON.parse(ev.data)); }; this.localStream?.getTracks().forEach(track => this.pc!.addTrack(track, this.localStream!)); this.pc.ontrack = (e) => this.onRemoteStream(e.streams[0]); this.pc.onicecandidate = async (e) => { if (e.candidate) { await this.roomChannel?.send({ type: 'broadcast', event: 'candidate', payload: { candidate: e.candidate } }); } }; this.pc.onconnectionstatechange = () => { const state = this.pc?.connectionState; if (state === 'connected') { this.setState('CONNECTED'); this.onNewConnection(); } else if (state === 'disconnected' || state === 'failed') { this.hangUp(true); } }; }
+  
+  // MODIFIED: createPeerConnection now uses the imported static iceServers
+  private createPeerConnection = (): void => {
+      if (this.pc) return;
+      this.pc = new RTCPeerConnection({ iceServers });
+      
+      this.dataChannel = this.pc.createDataChannel('chat');
+      this.dataChannel.onmessage = (e) => this.onNewMessage(JSON.parse(e.data));
+      this.pc.ondatachannel = (e) => {
+          this.dataChannel = e.channel;
+          this.dataChannel.onmessage = (ev) => this.onNewMessage(JSON.parse(ev.data));
+      };
+      this.localStream?.getTracks().forEach(track => this.pc!.addTrack(track, this.localStream!));
+      this.pc.ontrack = (e) => this.onRemoteStream(e.streams[0]);
+      this.pc.onicecandidate = async (e) => {
+          if (e.candidate) {
+              await this.roomChannel?.send({ type: 'broadcast', event: 'candidate', payload: { candidate: e.candidate } });
+          }
+      };
+      this.pc.onconnectionstatechange = () => {
+          const state = this.pc?.connectionState;
+          if (state === 'connected') {
+              this.setState('CONNECTED');
+              this.onNewConnection();
+          } else if (state === 'disconnected' || state === 'failed') {
+              this.hangUp(true);
+          }
+      };
+  }
+
   private createOffer = async (): Promise<void> => { if (!this.pc) this.createPeerConnection(); const offer = await this.pc!.createOffer(); await this.pc!.setLocalDescription(offer); await this.roomChannel?.send({ type: 'broadcast', event: 'offer', payload: { offer } }); }
   private cleanup = async (): Promise<void> => { this.pc?.close(); this.pc = null; if (this.pairingTimeout) clearTimeout(this.pairingTimeout); this.pairingTimeout = null; await this.cleanupLobby(); if(this.directMessageChannel) await supabase.removeChannel(this.directMessageChannel); if(this.roomChannel) await supabase.removeChannel(this.roomChannel); this.directMessageChannel = null; this.roomChannel = null; this.queuedCandidates = []; this.isOfferCreator = false; }
   private cleanupLobby = async (): Promise<void> => { if(this.lobbyChannel) await supabase.removeChannel(this.lobbyChannel); this.lobbyChannel = null; }
@@ -57,19 +103,8 @@ class ChatController {
   public toggleMute = (): void => { this.localStream?.getAudioTracks().forEach(t => t.enabled = !t.enabled); }
   public toggleVideo = (): void => { this.localStream?.getVideoTracks().forEach(t => t.enabled = !t.enabled); }
   public processQueuedCandidates = (): void => { while (this.queuedCandidates.length > 0 && this.pc?.remoteDescription) { const cand = this.queuedCandidates.shift(); if (cand) this.pc!.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.error('ICE error:', e)); } };
-  
-  // --- ADDED: New method for handling reconnection ---
-  public attemptToReconnect = () => {
-    if (this.pc && (this.pc.connectionState === 'disconnected' || this.pc.connectionState === 'failed')) {
-        console.log('Connection was lost, attempting ICE restart...');
-        this.pc.restartIce();
-    }
-  }
+  public attemptToReconnect = () => { if (this.pc && (this.pc.connectionState === 'disconnected' || this.pc.connectionState === 'failed')) { console.log('Connection was lost, attempting ICE restart...'); this.pc.restartIce(); } }
 }
-
-
-// Assume ChatPanelContent is now also a real component file
-// import ChatPanelContent from '../components/ChatPanelContent';
 
 // --- Main React Component ---
 const Home: FC = () => {
@@ -123,20 +158,27 @@ const Home: FC = () => {
         return () => subscription?.unsubscribe();
     }, []);
 
+    // REVERTED: This useEffect no longer fetches credentials
     useEffect(() => {
         if (session && !authLoading && controllerRef.current === null) {
             const chatController = new ChatController(
-                session.user.id, setAppState, setLocalStream, setRemoteStream,
+                session.user.id,
+                setAppState,
+                setLocalStream,
+                setRemoteStream,
                 (message: Message) => setMessages(prev => [...prev, message]),
                 () => setMessages([])
             );
+
             controllerRef.current = chatController;
             setUserId(chatController.getUserId());
-            chatController.initialize(); 
+            chatController.initialize();
         }
+
         const controller = controllerRef.current;
         const handleBeforeUnload = () => controller?.hangUp(false);
         window.addEventListener('beforeunload', handleBeforeUnload);
+
         return () => {
             window.removeEventListener('beforeunload', handleBeforeUnload);
             controller?.hangUp(false);
@@ -175,10 +217,8 @@ const Home: FC = () => {
     
     useEffect(() => { if (remoteVideoRef.current && remoteStream) remoteVideoRef.current.srcObject = remoteStream; }, [remoteStream]);
     
-    // --- ADDED: New useEffect for handling tab visibility ---
     useEffect(() => {
         const handleVisibilityChange = () => {
-            // When the user brings the tab back into focus
             if (document.visibilityState === 'visible') {
                 controllerRef.current?.attemptToReconnect();
             }
@@ -187,7 +227,7 @@ const Home: FC = () => {
         return () => {
             document.removeEventListener('visibilitychange', handleVisibilityChange);
         };
-    }, []); // Empty array ensures this runs only once.
+    }, []);
 
     // --- Handler Functions ---
     const handleEmojiClick = (emojiData: EmojiClickData) => { setChatInput(prevInput => prevInput + emojiData.emoji); setShowEmojiPicker(false); };
@@ -196,7 +236,7 @@ const Home: FC = () => {
     const handleSendMessage = () => { const sentMessage = controllerRef.current?.sendMessage(chatInput.trim()); if (sentMessage) { setMessages(prev => [...prev, sentMessage]); setChatInput(''); } };
     const handleToggleMute = () => { controllerRef.current?.toggleMute(); setIsMuted(!isMuted); }
     const handleToggleVideo = () => { controllerRef.current?.toggleVideo(); setIsVideoOff(!isVideoOff); }
-    const getStatusText = (): string => { switch (appState) { case 'IDLE': return 'Ready to Chat'; case 'SEARCHING': return 'Searching for a partner...'; case 'CONNECTING': return 'Connecting...'; case 'CONNECTED': return 'Connected'; default: return 'Loading...'; } };
+    const getStatusText = (): string => { switch (appState) { case 'IDLE': return 'Ready to Chat'; case 'AWAITING_MEDIA': return 'Waiting for media permissions...'; case 'SEARCHING': return 'Searching for a partner...'; case 'CONNECTING': return 'Connecting...'; case 'CONNECTED': return 'Connected'; case 'ERROR': return 'An error occurred. Please refresh.'; default: return 'Loading...'; } };
 
     if (authLoading) {
         return <div className="h-screen w-screen flex items-center justify-center bg-gray-900 text-white">Loading...</div>;
@@ -246,7 +286,6 @@ const Home: FC = () => {
                            )}
                        </div>
                     )}
-                    {/* This new version has responsive aspect ratios and positioning */}
                     <div className="absolute top-4 right-4 w-36 md:w-60 rounded-lg overflow-hidden shado-lg z-20 aspect-[3/4] md:aspect-video">
                          <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover bg-black/50" />
                         {isVideoOff && <div className="absolute inset-0 bg-black/70 flex items-center justify-center text-xs"><p>Video Off</p></div>}
